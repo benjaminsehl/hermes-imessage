@@ -4,6 +4,10 @@ A set of patches and a Hermes agent skill that make [Hermes Agent](https://githu
 
 Out of the box, Hermes treats iMessage like any other platform -- long messages, tool-use progress spam, no typing indicators. These patches fix that, making conversations feel like texting a friend, not querying a terminal.
 
+> [!NOTE]  
+> I've pushed the core of this thing upstream here: https://github.com/NousResearch/hermes-agent/pull/5869
+> Though, this version has a few more opinionated UX decisions
+
 ## What it does
 
 **Message delivery**
