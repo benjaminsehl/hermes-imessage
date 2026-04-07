@@ -1,0 +1,107 @@
+diff --git a/gateway/platforms/bluebubbles.py b/gateway/platforms/bluebubbles.py
+index 49148c70..8bbd80d5 100644
+--- a/gateway/platforms/bluebubbles.py
++++ b/gateway/platforms/bluebubbles.py
+@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
+ DEFAULT_WEBHOOK_HOST = "127.0.0.1"
+ DEFAULT_WEBHOOK_PORT = 8645
+ DEFAULT_WEBHOOK_PATH = "/bluebubbles-webhook"
+-MAX_TEXT_LENGTH = 4000
++MAX_TEXT_LENGTH = 800
+ 
+ # Tapback reaction codes (BlueBubbles associatedMessageType values)
+ _TAPBACK_ADDED = {
+@@ -123,6 +123,12 @@ class BlueBubblesAdapter(BasePlatformAdapter):
+         self._private_api_enabled: Optional[bool] = None
+         self._helper_connected: bool = False
+         self._guid_cache: Dict[str, str] = {}
++        # Debounce: buffer rapid messages per chat (e.g. link previews
++        # that iMessage splits into multiple deliveries).
++        self._debounce_buffers: Dict[str, List[str]] = {}
++        self._debounce_timers: Dict[str, asyncio.TimerHandle] = {}
++        self._debounce_events: Dict[str, tuple] = {}  # (event_template, source)
++        self._DEBOUNCE_SECS = 2.0
+ 
+     # ------------------------------------------------------------------
+     # API helpers
+@@ -237,11 +243,27 @@ class BlueBubblesAdapter(BasePlatformAdapter):
+     # Text sending
+     # ------------------------------------------------------------------
+ 
++    @staticmethod
++    def truncate_message(content: str, max_length: int = MAX_TEXT_LENGTH) -> List[str]:
++        # Use the base splitter but skip pagination indicators — iMessage
++        # bubbles flow naturally without "(1/3)" suffixes.
++        chunks = BasePlatformAdapter.truncate_message(content, max_length)
++        return [re.sub(r"\s*\(\d+/\d+\)$", "", c) for c in chunks]
++
+     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+         text = _strip_markdown(content or '')
+         if not text:
+             return SendResult(success=False, error='BlueBubbles send requires text')
+-        chunks = self.truncate_message(text, max_length=self.MAX_MESSAGE_LENGTH)
++        # Split on paragraph breaks first (double newlines) so each thought
++        # becomes its own iMessage bubble, then truncate any that are still
++        # too long.
++        paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
++        chunks = []
++        for para in (paragraphs or [text]):
++            if len(para) <= self.MAX_MESSAGE_LENGTH:
++                chunks.append(para)
++            else:
++                chunks.extend(self.truncate_message(para, max_length=self.MAX_MESSAGE_LENGTH))
+         last = SendResult(success=True)
+         for chunk in chunks:
+             guid = await self._resolve_chat_guid(chat_id)
+@@ -462,6 +484,27 @@ class BlueBubblesAdapter(BasePlatformAdapter):
+                 return candidate.strip()
+         return None
+ 
++    async def _flush_debounce(self, chat_key: str):
++        """Merge buffered messages and dispatch a single event."""
++        texts = self._debounce_buffers.pop(chat_key, [])
++        evt_data = self._debounce_events.pop(chat_key, None)
++        self._debounce_timers.pop(chat_key, None)
++        if not texts or not evt_data:
++            return
++        event_template, source = evt_data
++        merged = "\n".join(texts)
++        event = MessageEvent(
++            text=merged,
++            message_type=event_template.message_type,
++            source=source,
++            raw_message=event_template.raw_message,
++            message_id=event_template.message_id,
++            reply_to_message_id=event_template.reply_to_message_id,
++        )
++        task = asyncio.create_task(self.handle_message(event))
++        self._background_tasks.add(task)
++        task.add_done_callback(self._background_tasks.discard)
++
+     async def _handle_webhook(self, request):
+         from aiohttp import web
+         token = (
+@@ -547,9 +590,20 @@ class BlueBubblesAdapter(BasePlatformAdapter):
+             message_id=self._value(record.get('guid'), record.get('messageGuid'), record.get('id')),
+             reply_to_message_id=self._value(record.get('threadOriginatorGuid'), record.get('associatedMessageGuid')),
+         )
+-        task = asyncio.create_task(self.handle_message(event))
+-        self._background_tasks.add(task)
+-        task.add_done_callback(self._background_tasks.discard)
++
++        # Debounce: buffer rapid messages from the same chat so that
++        # link previews / multi-bubble sends get merged into one.
++        chat_key = session_chat_id
++        if chat_key in self._debounce_timers:
++            self._debounce_timers[chat_key].cancel()
++        self._debounce_buffers.setdefault(chat_key, []).append(text)
++        self._debounce_events[chat_key] = (event, source)
++
++        loop = asyncio.get_event_loop()
++        self._debounce_timers[chat_key] = loop.call_later(
++            self._DEBOUNCE_SECS,
++            lambda ck=chat_key: asyncio.ensure_future(self._flush_debounce(ck)),
++        )
+ 
+         # Fire-and-forget read receipt
+         if self.send_read_receipts and session_chat_id:

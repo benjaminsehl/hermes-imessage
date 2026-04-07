@@ -1,0 +1,42 @@
+diff --git a/gateway/run.py b/gateway/run.py
+index 14997d18..d1af4109 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -2902,6 +2902,37 @@ class GatewayRunner:
+                 except Exception as exc:
+                     logger.debug("@ context reference expansion failed: %s", exc)
+ 
++            # Send a quick contextual acknowledgment on platforms that can't
++            # show typing indicators or editable progress (e.g. iMessage).
++            from gateway.platforms.base import BasePlatformAdapter as _BaseAdapter
++            _ack_adapter = self.adapters.get(source.platform)
++            if _ack_adapter and type(_ack_adapter).edit_message is _BaseAdapter.edit_message:
++                _ack_text = "One sec\u2026"
++                try:
++                    from agent.auxiliary_client import call_llm as _ack_call_llm
++                    _ack_resp = _ack_call_llm(
++                        model="gpt-5.4-mini",
++                        max_tokens=30,
++                        messages=[
++                            {"role": "system", "content": (
++                                "You are a casual iMessage chatbot. The user just sent you a message "
++                                "and you need a moment to think. Generate a very brief, natural "
++                                "acknowledgment (under 8 words) so they know you're working on it. "
++                                "Be conversational, not robotic. No quotes. Just the text."
++                            )},
++                            {"role": "user", "content": message_text[:200]},
++                        ],
++                    )
++                    _ack_text = _ack_resp.choices[0].message.content.strip()
++                except Exception:
++                    pass
++                _ack_thread = {"thread_id": source.thread_id} if source.thread_id else None
++                await _ack_adapter.send(
++                    chat_id=source.chat_id,
++                    content=_ack_text,
++                    metadata=_ack_thread,
++                )
++
+             # Run the agent
+             agent_result = await self._run_agent(
+                 message=message_text,
