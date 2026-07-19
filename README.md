@@ -44,6 +44,8 @@ The live Hermes checkout should use the fork as `origin`, Nous Research as `upst
 
 Fork operations and recovery are documented in `DOWNSTREAM_BLUEBUBBLES.md` in the maintained fork.
 
+The local drift watchdog is versioned at `scripts/hermes_update_drift_audit.py`; `~/.hermes/scripts/hermes_update_drift_audit.py` symlinks to it for the scheduled audit. It separately reports live-vs-tested-release drift and tested-fork-vs-Nous drift, so intentional downstream commits are not mistaken for update risk.
+
 ## Manual patch installation
 
 Use this recovery path for an upstream checkout that is not following the maintained fork:
@@ -104,6 +106,8 @@ Then send one substantive iMessage. Expected behavior:
 patches/
   current-bluebubbles-ack-dedupe.patch  # Current tested patch
   legacy/                               # Historical patches; do not apply to current Hermes
+scripts/
+  hermes_update_drift_audit.py          # Fork-aware local update watchdog
 skill/
   imessage-ux/
     SKILL.md
