@@ -1,5 +1,5 @@
 diff --git a/gateway/platforms/bluebubbles.py b/gateway/platforms/bluebubbles.py
-index 60fe57031..0406ab25a 100644
+index 60fe57031..03f3c7dcc 100644
 --- a/gateway/platforms/bluebubbles.py
 +++ b/gateway/platforms/bluebubbles.py
 @@ -13,11 +13,12 @@ import json
@@ -597,15 +597,40 @@ index 60fe57031..0406ab25a 100644
          if not sender or not (chat_guid or chat_identifier) or not text:
              return web.json_response({"error": "missing message fields"}, status=400)
  
-@@ -1012,6 +1424,98 @@ class BlueBubblesAdapter(BasePlatformAdapter):
+@@ -1012,32 +1424,148 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                  )
                  return web.Response(text="ok")
              text = self._clean_mention_text(text)
+-        source = self.build_source(
+-            chat_id=session_chat_id,
+-            chat_name=chat_identifier or sender,
+-            chat_type="group" if is_group else "dm",
+-            user_id=sender,
+-            user_name=sender,
+-            chat_id_alt=chat_identifier,
 +        message_guid = self._value(
 +            record.get("guid"),
 +            record.get("messageGuid"),
 +            record.get("id"),
-+        )
+         )
+-        event = MessageEvent(
+-            text=text,
+-            message_type=msg_type,
+-            source=source,
+-            raw_message=payload,
+-            message_id=self._value(
+-                record.get("guid"),
+-                record.get("messageGuid"),
+-                record.get("id"),
+-            ),
+-            reply_to_message_id=self._value(
+-                record.get("threadOriginatorGuid"),
+-                record.get("associatedMessageGuid"),
+-            ),
+-            media_urls=media_urls,
+-            media_types=media_types,
+-        )
+-        task = asyncio.create_task(self.handle_message(event))
 +        join_deadline = time.monotonic() + _MESSAGE_DEDUP_JOIN_TIMEOUT_SECONDS
 +        join_attempts = 0
 +        while True:
@@ -693,36 +718,32 @@ index 60fe57031..0406ab25a 100644
 +                {"error": "attachment download unavailable"}, status=503
 +            )
 +
-         source = self.build_source(
-             chat_id=session_chat_id,
-             chat_name=chat_identifier or sender,
-@@ -1021,23 +1525,43 @@ class BlueBubblesAdapter(BasePlatformAdapter):
-             chat_id_alt=chat_identifier,
-         )
-         event = MessageEvent(
--            text=text,
--            message_type=msg_type,
-+            text="(attachment)" if delivery_kind == "late_enrich" else text,
-+            message_type=MessageType.TEXT,
-             source=source,
-             raw_message=payload,
--            message_id=self._value(
--                record.get("guid"),
--                record.get("messageGuid"),
--                record.get("id"),
--            ),
-+            message_id=message_guid,
-             reply_to_message_id=self._value(
-                 record.get("threadOriginatorGuid"),
-                 record.get("associatedMessageGuid"),
-             ),
--            media_urls=media_urls,
--            media_types=media_types,
-+            media_urls=[],
-+            media_types=[],
-         )
--        task = asyncio.create_task(self.handle_message(event))
-+        self._apply_reservation_media(event, working_reservation)
++        try:
++            source = self.build_source(
++                chat_id=session_chat_id,
++                chat_name=chat_identifier or sender,
++                chat_type="group" if is_group else "dm",
++                user_id=sender,
++                user_name=sender,
++                chat_id_alt=chat_identifier,
++            )
++            event = MessageEvent(
++                text="(attachment)" if delivery_kind == "late_enrich" else text,
++                message_type=MessageType.TEXT,
++                source=source,
++                raw_message=payload,
++                message_id=message_guid,
++                reply_to_message_id=self._value(
++                    record.get("threadOriginatorGuid"),
++                    record.get("associatedMessageGuid"),
++                ),
++                media_urls=[],
++                media_types=[],
++            )
++            self._apply_reservation_media(event, working_reservation)
++        except BaseException:
++            self._release_message_reservation(message_guid, reservation)
++            raise
 +
 +        async def dispatch_reserved_event() -> None:
 +            try:
@@ -898,7 +919,7 @@ index b071e4854..a2c8e3516 100644
  
              _bg_review_release = threading.Event()
 diff --git a/tests/gateway/test_bluebubbles.py b/tests/gateway/test_bluebubbles.py
-index 11358ab2b..1eabdcf54 100644
+index 11358ab2b..a2967fc1a 100644
 --- a/tests/gateway/test_bluebubbles.py
 +++ b/tests/gateway/test_bluebubbles.py
 @@ -1,7 +1,10 @@
@@ -938,7 +959,7 @@ index 11358ab2b..1eabdcf54 100644
      def test_format_message_strips_markdown(self, monkeypatch):
          adapter = _make_adapter(monkeypatch)
          assert adapter.format_message("**Hello** `world`") == "Hello world"
-@@ -406,6 +428,1165 @@ class TestBlueBubblesWebhookParsing:
+@@ -406,6 +428,1274 @@ class TestBlueBubblesWebhookParsing:
          assert record["text"] == "hello"
  
  
@@ -1570,6 +1591,115 @@ index 11358ab2b..1eabdcf54 100644
 +        assert [event.message_id for event in handled] == ["retry-schedule-guid"]
 +
 +    @pytest.mark.asyncio
++    @pytest.mark.parametrize("failure_site", ["build_source", "message_event", "apply_media"])
++    async def test_synchronous_event_setup_failure_releases_reservation_for_retry(
++        self, monkeypatch, failure_site
++    ):
++        import gateway.platforms.bluebubbles as bluebubbles
++
++        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
++        handled = []
++        monkeypatch.setattr(
++            adapter, "handle_message", AsyncMock(side_effect=handled.append)
++        )
++        setup_attempts = 0
++
++        def fail_once_then(call):
++            def wrapped(*args, **kwargs):
++                nonlocal setup_attempts
++                setup_attempts += 1
++                if setup_attempts == 1:
++                    raise RuntimeError("event setup failed")
++                return call(*args, **kwargs)
++
++            return wrapped
++
++        if failure_site == "build_source":
++            monkeypatch.setattr(
++                adapter, "build_source", fail_once_then(adapter.build_source)
++            )
++        elif failure_site == "message_event":
++            monkeypatch.setattr(
++                bluebubbles,
++                "MessageEvent",
++                fail_once_then(bluebubbles.MessageEvent),
++            )
++        else:
++            monkeypatch.setattr(
++                adapter,
++                "_apply_reservation_media",
++                fail_once_then(adapter._apply_reservation_media),
++            )
++        payload = self._payload(f"retry-{failure_site}-guid")
++
++        with pytest.raises(RuntimeError, match="event setup failed"):
++            await adapter._handle_webhook(_FakeBlueBubblesRequest(payload))
++        assert f"retry-{failure_site}-guid" not in adapter._seen_message_guids
++        assert (
++            await adapter._handle_webhook(_FakeBlueBubblesRequest(payload))
++        ).status == 200
++        await asyncio.sleep(0)
++
++        assert [event.message_id for event in handled] == [
++            f"retry-{failure_site}-guid"
++        ]
++
++    @pytest.mark.asyncio
++    async def test_late_enrichment_setup_failure_restores_reservation_for_retry(
++        self, monkeypatch
++    ):
++        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
++        handled = []
++        monkeypatch.setattr(
++            adapter, "handle_message", AsyncMock(side_effect=handled.append)
++        )
++        monkeypatch.setattr(
++            adapter,
++            "_download_attachment",
++            AsyncMock(return_value="/cache/retried-enrichment.jpg"),
++        )
++        original = self._payload("retry-late-setup-guid")
++        enriched = self._payload(
++            "retry-late-setup-guid",
++            event_type="updated-message",
++            attachments=[{"guid": "late-setup-att", "mimeType": "image/jpeg"}],
++        )
++
++        assert (
++            await adapter._handle_webhook(_FakeBlueBubblesRequest(original))
++        ).status == 200
++        if adapter._background_tasks:
++            await asyncio.gather(*list(adapter._background_tasks))
++
++        original_apply = adapter._apply_reservation_media
++        setup_attempts = 0
++
++        def fail_first_enrichment(event, reservation):
++            nonlocal setup_attempts
++            setup_attempts += 1
++            if setup_attempts == 1:
++                raise RuntimeError("late setup failed")
++            return original_apply(event, reservation)
++
++        monkeypatch.setattr(
++            adapter, "_apply_reservation_media", fail_first_enrichment
++        )
++        with pytest.raises(RuntimeError, match="late setup failed"):
++            await adapter._handle_webhook(_FakeBlueBubblesRequest(enriched))
++        reservation = adapter._seen_message_guids["retry-late-setup-guid"]
++        assert reservation["state"] == "complete"
++        assert "late-setup-att" not in reservation["attachment_guids"]
++
++        assert (
++            await adapter._handle_webhook(_FakeBlueBubblesRequest(enriched))
++        ).status == 200
++        if adapter._background_tasks:
++            await asyncio.gather(*list(adapter._background_tasks))
++
++        assert len(handled) == 2
++        assert handled[1].media_urls == ["/cache/retried-enrichment.jpg"]
++
++    @pytest.mark.asyncio
 +    async def test_observable_dispatch_failure_releases_reservation_for_retry(
 +        self, monkeypatch
 +    ):
@@ -2104,7 +2234,7 @@ index 11358ab2b..1eabdcf54 100644
  class TestBlueBubblesGuidResolution:
      def test_raw_guid_returned_as_is(self, monkeypatch):
          """If target already contains ';' it's a raw GUID — return unchanged."""
-@@ -658,19 +1839,19 @@ class TestBlueBubblesAttachmentDownload:
+@@ -658,19 +1948,19 @@ class TestBlueBubblesAttachmentDownload:
  
  
  class TestBlueBubblesWebhookUrl:
@@ -2128,7 +2258,7 @@ index 11358ab2b..1eabdcf54 100644
  
      def test_custom_host_preserved(self, monkeypatch):
          adapter = _make_adapter(monkeypatch, webhook_host="192.168.1.50")
-@@ -763,6 +1944,52 @@ class TestBlueBubblesWebhookRegistration:
+@@ -763,6 +2053,52 @@ class TestBlueBubblesWebhookRegistration:
          assert len(result) == 1
          assert result[0]["id"] == 1
  
@@ -2181,7 +2311,7 @@ index 11358ab2b..1eabdcf54 100644
      def test_find_registered_webhooks_empty_when_none(self, monkeypatch):
          import asyncio
          adapter = _make_adapter(monkeypatch)
-@@ -824,7 +2051,7 @@ class TestBlueBubblesWebhookRegistration:
+@@ -824,7 +2160,7 @@ class TestBlueBubblesWebhookRegistration:
          url = adapter._webhook_register_url
          adapter.client = self._mock_client(
              get_response={"status": 200, "data": [
@@ -2190,7 +2320,7 @@ index 11358ab2b..1eabdcf54 100644
              ]},
          )
  
-@@ -843,6 +2070,56 @@ class TestBlueBubblesWebhookRegistration:
+@@ -843,6 +2179,56 @@ class TestBlueBubblesWebhookRegistration:
          assert ok is True
          assert not post_called, "Should reuse existing, not POST again"
  
