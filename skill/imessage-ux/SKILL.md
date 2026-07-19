@@ -1,7 +1,7 @@
 ---
 name: imessage-ux
 description: Optimizes Hermes responses over BlueBubbles with concise iMessage delivery, contextual pre-response acknowledgments, and duplicate-delivery protection
-version: 2.2.0
+version: 2.3.0
 author: Benjamin Sehl
 license: MIT
 platforms: [macos]
@@ -65,7 +65,13 @@ display:
 
 The model is optional. The timeout is clamped to 0.5–10 seconds.
 
-## Installation
+## Durable updates
+
+Prefer the maintained `benjaminsehl/hermes-agent` fork as the live checkout's `origin`, with Nous Research configured as `upstream`. Fork `main` advances only after its scheduled upstream merge passes the BlueBubbles contract gate. This avoids Hermes' unsafe conflict path where a failed autostash restore resets to clean upstream and still restarts the gateway.
+
+Keep this repository's current patch as portable recovery material, not as the primary live update mechanism. If upstream integration fails, leave fork `main` and the live gateway on the last known-good commit, port the implementation in a candidate worktree, rerun the full contract and review gates, and only then advance the fork.
+
+## Manual patch recovery
 
 ```bash
 cd ~/.hermes/hermes-agent

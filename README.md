@@ -31,12 +31,22 @@ Different GUIDs still dispatch normally, malformed payloads cannot poison a late
 The current patch is generated and tested against Hermes Agent commit:
 
 ```text
-299e409f1 feat(delegation): live-viewable subagent transcripts — tail your subagents while they work (#67479)
+dd418284d bench(desktop): trustworthy --spawn stream numbers + real baseline (#67694)
 ```
 
 Always run `git apply --check` before applying it to a newer Hermes checkout.
 
-## Installation
+## Durable update channel
+
+The preferred installation is the maintained `benjaminsehl/hermes-agent` fork. Its `main` branch contains current Nous Research `main` plus this implementation. A scheduled fail-closed workflow merges upstream into a candidate, runs the 192-test BlueBubbles contract gate, and advances fork `main` only when every check passes. Conflicts or regressions leave the last known-good release untouched.
+
+The live Hermes checkout should use the fork as `origin`, Nous Research as `upstream`, and track `origin/main`. Plain `hermes update` then consumes only tested downstream releases; it does not depend on restoring an uncommitted patch from git stash.
+
+Fork operations and recovery are documented in `DOWNSTREAM_BLUEBUBBLES.md` in the maintained fork.
+
+## Manual patch installation
+
+Use this recovery path for an upstream checkout that is not following the maintained fork:
 
 ```bash
 cd ~/.hermes/hermes-agent
