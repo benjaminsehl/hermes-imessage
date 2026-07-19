@@ -1,7 +1,7 @@
 ---
 name: imessage-ux
-description: Optimizes Hermes responses for iMessage via BlueBubbles -- shorter messages, multi-bubble delivery, contextual acknowledgments, and input debouncing
-version: 1.0.0
+description: Optimizes Hermes responses over BlueBubbles with concise iMessage delivery, contextual pre-response acknowledgments, and duplicate-delivery protection
+version: 2.2.0
 author: Benjamin Sehl
 license: MIT
 platforms: [macos]
@@ -9,84 +9,83 @@ metadata:
   hermes:
     tags: [iMessage, BlueBubbles, messaging, UX]
     requires_toolsets: []
-    related_skills: [bluebubbles-channels]
+    related_skills: [bluebubbles-channel-integration]
 ---
 
-# iMessage UX Optimization
+# iMessage UX optimization
 
-Makes Hermes feel native on iMessage by adapting its output style and delivery mechanics to how people actually text.
+Use this guidance when Hermes is responding through BlueBubbles/iMessage.
 
-## When to Use
+## Response style
 
-This skill is loaded automatically when the agent is responding via the BlueBubbles (iMessage) platform. It provides guidance on response formatting that works with the adapter-level patches.
+- Write like a useful text conversation, not a report.
+- Lead with the answer or result.
+- Keep each thought short and conversational.
+- Separate distinct thoughts with blank lines so paragraph-aware delivery can produce natural bubbles.
+- Avoid headings and long lists unless the user asked for detail.
+- Do not repeat a visible quick acknowledgment in the final response.
+- Do not narrate internal agent mechanics or tool activity.
 
-## The Problem
+## Current adapter behavior
 
-By default, Hermes treats iMessage like Slack or Discord:
-- Sends one giant message that gets split at arbitrary character limits
-- Shows `(1/3)` pagination suffixes
-- Spams tool-use progress as separate message bubbles (`browser_navigate: "..."`)
-- No feedback while thinking (30+ seconds of silence)
-- Responses are too long and formal for a texting context
+The current patch adds two behaviors that are not yet present on the tested Hermes main revision:
 
-## How It Works
+1. Contextual quick acknowledgment
+   - BlueBubbles-only and disabled by default.
+   - Uses Hermes' asynchronous auxiliary LLM router.
+   - Skips slash commands, greetings, pings, thanks, and yes/no replies.
+   - Uses one hard deadline across generation and BlueBubbles delivery, reserving a bounded slice for fallback sending without waiting for cancellation cleanup.
+   - Places generation rules in a system message and accepts generated/configured text only when it matches a strict pending-work grammar; otherwise it uses the safe built-in fallback.
+   - Passes the visible acknowledgment directly into the exact current main turn through the API-content sidecar without mutating prior history, adding a synthetic user role, or leaving reusable session-key state behind.
+   - Preserves the exception class for empty-message BlueBubbles timeouts so an ambiguous, already-delivered send does not trigger an extra formatting fallback bubble.
 
-This skill has two layers:
+2. Stable-GUID deduplication
+   - Canonicalizes local webhook registration to IPv4 `127.0.0.1`.
+   - Collapses equivalent `localhost`/`127.0.0.1` duplicate registrations and repairs stale event subscriptions.
+   - Enforces the 64-attachment bound even when BlueBubbles omits the message GUID.
+   - Reserves a validated iMessage GUID before attachment network/disk work, so equivalent `updated-message`/`new-message` deliveries join one outcome, share one download and one dispatch, and a waiting duplicate can take over after owner failure.
+   - Caps outcome joining at 64 waiters, a 30-second request-wide deadline, and four joined outcomes; overflow, timeout, or repeated displacement returns retryable HTTP 503.
+   - Keeps in-flight reservations out of TTL/LRU eviction; all-in-flight capacity pressure returns retryable HTTP 503.
+   - Bounds metadata-only completed state to 2,048 entries for 15 minutes and each message to 64 attachment GUIDs; it does not retain raw webhook events and preserves BlueBubbles attachment order.
+   - Serializes new media against an in-flight owner, then dispatches genuinely late media once as an attachment-only enrichment; failed or cancelled enrichment rolls back so BlueBubbles retries remain possible.
 
-### 1. Adapter patches (applied to Hermes core)
+Hermes upstream already supplies paragraph-aware BlueBubbles delivery, pagination-suffix removal, platform response guidance, configurable progress display, and webhook registration management. Do not reapply the historical implementations of those features.
 
-These modify the BlueBubbles adapter and gateway to:
+## Configuration
 
-- **Split on paragraphs** -- each double-newline-separated block becomes its own iMessage bubble, so the model controls message boundaries by how it structures its output
-- **Reduce chunk size** -- 800 chars max per bubble (down from 4,000), so overflow splits are still text-sized
-- **Strip pagination** -- no `(1/3)` suffixes, bubbles flow naturally
-- **Debounce input** -- 2-second buffer merges rapid messages (link previews, multi-bubble pastes) into one agent invocation
-- **Suppress tool progress** -- platforms without message editing skip progress bubbles entirely
-- **Contextual acknowledgment** -- a fast LLM call generates a brief, context-aware reply (e.g., "Let me check that out") before the main model starts, so the user isn't waiting in silence
+```yaml
+display:
+  platforms:
+    bluebubbles:
+      quick_ack_enabled: true
+      quick_ack_model: gpt-5.4-mini
+      quick_ack_fallback: "Got it — I’m looking into that."
+      quick_ack_timeout_seconds: 3
+```
 
-### 2. System prompt injection (via session.py patch)
-
-When the source platform is BlueBubbles, the session context includes:
-
-> You are responding via iMessage. Keep responses short and conversational -- think texts, not essays. Structure longer replies as separate short thoughts, each separated by a blank line (double newline). Each block between blank lines will be delivered as its own iMessage bubble, so write accordingly: one idea per bubble, 1-3 sentences each. If the user needs a detailed answer, give the short version first and offer to elaborate.
-
-This tells the model *why* paragraph breaks matter (they become separate bubbles) and sets the right tone.
+The model is optional. The timeout is clamped to 0.5–10 seconds.
 
 ## Installation
 
 ```bash
-# Apply the three patches to your Hermes install
 cd ~/.hermes/hermes-agent
-git apply /path/to/patches/bluebubbles-ux.patch
-git apply /path/to/patches/gateway-ack-and-progress.patch
-git apply /path/to/patches/session-platform-notes.patch
-
-# Install this skill
-cp -r /path/to/skill/imessage-ux ~/.hermes/skills/imessage-ux
-
-# Restart
+git apply --check /path/to/hermes-imessage/patches/current-bluebubbles-ack-dedupe.patch
+git apply /path/to/hermes-imessage/patches/current-bluebubbles-ack-dedupe.patch
 hermes gateway restart
 ```
 
-## Configuration
-
-| Setting | Location | Default | Description |
-|---------|----------|---------|-------------|
-| Chunk size | `bluebubbles.py` `MAX_TEXT_LENGTH` | 800 | Max characters per bubble |
-| Debounce window | `bluebubbles.py` `_DEBOUNCE_SECS` | 2.0 | Seconds to wait for more messages |
-| Ack model | `run.py` ack block | `gpt-5.4-mini` | Fast model for acknowledgments |
-| Ack max tokens | `run.py` ack block | 30 | Keep acks very short |
-
-## Pitfalls
-
-- **Ack model not configured**: If your LLM provider doesn't have the configured model, the ack falls back to "One sec..." silently. Check `hermes gateway status` and logs at `~/.hermes/logs/gateway.log`.
-- **Debounce too aggressive**: If 2 seconds feels too slow, lower `_DEBOUNCE_SECS`. If you send long multi-part messages, you may need to raise it.
-- **Code blocks**: The paragraph splitter won't break inside code fences -- those get handled by the base `truncate_message` which preserves code block boundaries.
+Do not apply files under `patches/legacy/` to current Hermes.
 
 ## Verification
 
-1. Send a message to Hermes via iMessage
-2. You should see a brief contextual ack within ~1 second
-3. The response should arrive as multiple short bubbles, not one wall of text
-4. Send a message with a URL -- the debouncer should merge it with the link preview into one request
-5. Ask something that triggers tool use -- you should NOT see `browser_navigate` or similar tool bubbles
+1. Run the focused gateway tests documented in the repository README.
+2. Send a substantive iMessage and confirm one acknowledgment arrives before one final reply.
+3. Send `ping`; confirm there is no separate acknowledgment.
+4. Confirm gateway logs show only one inbound agent run for a BlueBubbles GUID even if both `new-message` and `updated-message` are emitted.
+
+## Pitfalls
+
+- Two full replies can come from duplicate registrations or from two event types carrying the same GUID. Verify both the webhook registry and gateway inbound logs.
+- A fast model must be available through Hermes' auxiliary routing. Generation failure should produce the configured fallback, not block the main turn.
+- Keep acknowledgments noncommittal. They may say that Hermes is looking or checking, but must never claim the requested work is complete.
+- Preserve prompt-cache and role-alternation invariants. Do not append acknowledgment text as an extra historical assistant turn or inject a synthetic user continuation.
